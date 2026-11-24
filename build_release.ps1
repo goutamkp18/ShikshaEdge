@@ -15,3 +15,8 @@ if (Test-Path "build") {
 
 Write-Host "Building release APK..."
 & "D:\tools\flutter\bin\flutter.bat" build apk --release
+
+if ($LASTEXITCODE -eq 0) {
+    Copy-Item "D:\ShikshaEdge\android-app\build\app\outputs\flutter-apk\app-release.apk" "D:\ShikshaEdge\ShikshaEdge-release.apk" -Force
+    Write-Host "Release APK successfully copied to D:\ShikshaEdge\ShikshaEdge-release.apk"
+}

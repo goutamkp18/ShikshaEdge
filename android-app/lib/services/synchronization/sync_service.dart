@@ -37,6 +37,9 @@ class SyncService {
   SupabaseClient? _supabaseClient;
   StreamSubscription<bool>? _connectivitySubscription;
   bool _isSynchronizing = false;
+  SyncResult? _lastSyncResult;
+
+  SyncResult? get lastSyncResult => _lastSyncResult;
 
   SyncService({
     DatabaseHelper? dbHelper,
@@ -63,6 +66,29 @@ class SyncService {
     _connectivitySubscription?.cancel();
   }
 
+  String _toUserFriendlyError(dynamic error) {
+    final errStr = error.toString().toLowerCase();
+    if (errStr.contains('socketexception') ||
+        errStr.contains('failed host lookup') ||
+        errStr.contains('no address associated with hostname') ||
+        errStr.contains('network is unreachable') ||
+        errStr.contains('connection refused') ||
+        errStr.contains('connection timed out') ||
+        errStr.contains('handshakeexception') ||
+        errStr.contains('errno = 7')) {
+      return 'Unable to reach cloud server. Please check internet connection.';
+    }
+    if (errStr.contains('anonymous_provider_disabled') ||
+        errStr.contains('invalid api key') ||
+        errStr.contains('jwt')) {
+      return 'Cloud service is currently undergoing maintenance. Local progress is safe.';
+    }
+    if (errStr.contains('restoration failed') || errStr.contains('cannot silently replace')) {
+      return 'Cloud identity could not be verified. Local learning data remains secure.';
+    }
+    return 'Unable to complete cloud sync. All learning progress is preserved locally.';
+  }
+
   Future<int> getPendingSyncCount() async {
     final db = await _dbHelper.database;
     final res = await db.rawQuery(
@@ -71,9 +97,18 @@ class SyncService {
     return Sqflite.firstIntValue(res) ?? 0;
   }
 
+  Future<int> getFailedSyncCount() async {
+    final db = await _dbHelper.database;
+    final res = await db.rawQuery(
+      "SELECT COUNT(*) as count FROM sync_queue WHERE status = 'failed'",
+    );
+    return Sqflite.firstIntValue(res) ?? 0;
+  }
+
   /// Check current synchronization state
   Future<SyncResult> getSyncState() async {
     final pending = await getPendingSyncCount();
+    final failed = await getFailedSyncCount();
     final isOnline = await _connectivity.checkIsOnline();
 
     final url = await AppConfig.getSavedSupabaseUrl();
@@ -91,7 +126,24 @@ class SyncService {
       return SyncResult(
         status: SyncStatus.offline,
         pendingCount: pending,
-        message: pending > 0 ? '$pending changes pending sync.' : 'Offline mode active. Learning is ready.',
+        message: pending > 0 ? '$pending records waiting to sync.' : 'Offline mode active. Learning is ready.',
+      );
+    }
+
+    // If the last synchronization failed, reflect the failure accurately
+    if (_lastSyncResult != null && _lastSyncResult!.status == SyncStatus.failed) {
+      return SyncResult(
+        status: SyncStatus.failed,
+        pendingCount: pending,
+        message: _lastSyncResult!.message,
+      );
+    }
+
+    if (failed > 0) {
+      return SyncResult(
+        status: SyncStatus.failed,
+        pendingCount: pending,
+        message: '$failed records could not be synced. Tap below to retry.',
       );
     }
 
@@ -190,203 +242,227 @@ class SyncService {
       final pendingCount = await getPendingSyncCount();
       final isOnline = await _connectivity.checkIsOnline();
 
-    if (!isOnline) {
-      return SyncResult(
-        status: SyncStatus.offline,
-        pendingCount: pendingCount,
-        message: 'Internet connection is unavailable. Progress saved locally.',
-      );
-    }
-
-    final url = await AppConfig.getSavedSupabaseUrl();
-    final anonKey = await AppConfig.getSavedSupabaseAnonKey();
-
-    if (url == null || url.isEmpty || anonKey == null || anonKey.isEmpty) {
-      return SyncResult(
-        status: SyncStatus.unconfigured,
-        pendingCount: pendingCount,
-        message: 'Supabase backend credentials not set. Offline mode continues.',
-      );
-    }
-
-    // Initialize Supabase client dynamically if needed
-    try {
-      _supabaseClient ??= SupabaseClient(url, anonKey);
-    } catch (e) {
-      return SyncResult(
-        status: SyncStatus.failed,
-        pendingCount: pendingCount,
-        message: 'Failed to connect to backend: ${e.toString()}',
-      );
-    }
-
-    // Authenticate using Supabase Anonymous Authentication
-    final User authenticatedUser;
-    try {
-      authenticatedUser = await getOrCreateAuthenticatedUser(_supabaseClient!);
-    } catch (authError) {
-      return SyncResult(
-        status: SyncStatus.failed,
-        pendingCount: pendingCount,
-        message: 'Cloud authentication failed: ${authError.toString()}',
-      );
-    }
-
-    final db = await _dbHelper.database;
-    final queueItems = await db.query(
-      'sync_queue',
-      where: "status = 'pending' OR status = 'failed'",
-      orderBy: 'created_at ASC',
-      limit: 100,
-    );
-
-    if (queueItems.isEmpty) {
-      return SyncResult(
-        status: SyncStatus.synced,
-        pendingCount: 0,
-        authenticatedOwnerId: authenticatedUser.id,
-        message: 'All records are up to date.',
-      );
-    }
-
-    int syncedSuccess = 0;
-
-    // Strict Ordering (Requirement 6):
-    // Synchronize student_profiles BEFORE uploading student_attempts
-    final profileItems = queueItems.where((r) => r['entity_type'] == 'student_profile').toList();
-    final attemptItems = queueItems.where((r) => r['entity_type'] == 'attempt').toList();
-    final otherItems = queueItems.where((r) => r['entity_type'] != 'student_profile' && r['entity_type'] != 'attempt').toList();
-
-    // 1. Sync Student Profiles first
-    for (var row in profileItems) {
-      final itemId = row['id'] as String;
-      final payloadJson = row['payload_json'] as String;
-      final Map<String, dynamic> payload = json.decode(payloadJson);
-
-      try {
-        await _supabaseClient!.from('student_profiles').upsert({
-          'id': payload['id'],
-          'owner_id': authenticatedUser.id, // Strictly uses authenticated user's UUID
-          'name': payload['name'],
-          'class_id': payload['class_id'],
-          'preferred_language': payload['preferred_language'],
-          'avatar_id': payload['avatar_id'],
-          'classroom_code': payload['classroom_code'],
-          'created_at': payload['created_at'],
-          'last_active_at': payload['last_active_at'],
-        });
-
-        await db.update(
-          'sync_queue',
-          {
-            'status': 'synced',
-            'last_attempt_at': DateTime.now().toIso8601String(),
-          },
-          where: 'id = ?',
-          whereArgs: [itemId],
+      if (!isOnline) {
+        final res = SyncResult(
+          status: SyncStatus.offline,
+          pendingCount: pendingCount,
+          message: 'Internet connection is unavailable. Progress saved locally.',
         );
-        syncedSuccess++;
-      } catch (e) {
-        final retries = (row['retry_count'] as int) + 1;
-        await db.update(
-          'sync_queue',
-          {
-            'status': 'failed',
-            'retry_count': retries,
-            'last_attempt_at': DateTime.now().toIso8601String(),
-          },
-          where: 'id = ?',
-          whereArgs: [itemId],
-        );
+        _lastSyncResult = res;
+        return res;
       }
-    }
 
-    // 2. Sync Student Attempts second (Strict requirement: ignoreDuplicates: true)
-    for (var row in attemptItems) {
-      final itemId = row['id'] as String;
-      final payloadJson = row['payload_json'] as String;
-      final Map<String, dynamic> payload = json.decode(payloadJson);
+      final url = await AppConfig.getSavedSupabaseUrl();
+      final anonKey = await AppConfig.getSavedSupabaseAnonKey();
 
-      try {
-        await _supabaseClient!.from('student_attempts').upsert(
-          {
-            'id': payload['attempt_id'],
-            'student_id': payload['student_id'],
-            'question_id': payload['question_id'],
-            'topic_id': payload['topic_id'],
-            'skill_id': payload['skill_id'],
-            'selected_option_id': payload['selected_option_id'],
-            'is_correct': payload['is_correct'],
-            'difficulty': payload['difficulty'],
-            'mastery_before': payload['mastery_before'],
-            'mastery_after': payload['mastery_after'],
-            'answered_at': payload['answered_at'],
-            'created_at': payload['created_at'],
-          },
-          ignoreDuplicates: true,
+      if (url == null || url.isEmpty || anonKey == null || anonKey.isEmpty) {
+        final res = SyncResult(
+          status: SyncStatus.unconfigured,
+          pendingCount: pendingCount,
+          message: 'Supabase backend credentials not set. Offline mode continues.',
         );
-
-        await db.update(
-          'sync_queue',
-          {
-            'status': 'synced',
-            'last_attempt_at': DateTime.now().toIso8601String(),
-          },
-          where: 'id = ?',
-          whereArgs: [itemId],
-        );
-        syncedSuccess++;
-      } catch (e) {
-        final retries = (row['retry_count'] as int) + 1;
-        await db.update(
-          'sync_queue',
-          {
-            'status': 'failed',
-            'retry_count': retries,
-            'last_attempt_at': DateTime.now().toIso8601String(),
-          },
-          where: 'id = ?',
-          whereArgs: [itemId],
-        );
+        _lastSyncResult = res;
+        return res;
       }
-    }
 
-    // 3. Sync any other remaining items
-    for (var row in otherItems) {
-      final itemId = row['id'] as String;
-      // Mark as synced locally
-      await db.update(
+      // Initialize Supabase client dynamically if needed
+      try {
+        _supabaseClient ??= SupabaseClient(url, anonKey);
+      } catch (e) {
+        final res = SyncResult(
+          status: SyncStatus.failed,
+          pendingCount: pendingCount,
+          message: _toUserFriendlyError(e),
+        );
+        _lastSyncResult = res;
+        return res;
+      }
+
+      // Authenticate using Supabase Anonymous Authentication
+      final User authenticatedUser;
+      try {
+        authenticatedUser = await getOrCreateAuthenticatedUser(_supabaseClient!);
+      } catch (authError) {
+        final res = SyncResult(
+          status: SyncStatus.failed,
+          pendingCount: pendingCount,
+          message: _toUserFriendlyError(authError),
+        );
+        _lastSyncResult = res;
+        return res;
+      }
+
+      final db = await _dbHelper.database;
+      final queueItems = await db.query(
         'sync_queue',
-        {
-          'status': 'synced',
-          'last_attempt_at': DateTime.now().toIso8601String(),
-        },
-        where: 'id = ?',
-        whereArgs: [itemId],
+        where: "status = 'pending' OR status = 'failed'",
+        orderBy: 'created_at ASC',
+        limit: 100,
       );
-      syncedSuccess++;
-    }
 
-    final remaining = await getPendingSyncCount();
-    if (remaining == 0) {
-      return SyncResult(
-        status: SyncStatus.synced,
-        pendingCount: 0,
-        syncedCount: syncedSuccess,
-        authenticatedOwnerId: authenticatedUser.id,
-        message: 'Successfully synchronized $syncedSuccess records.',
-      );
-    } else {
-      return SyncResult(
+      if (queueItems.isEmpty) {
+        final res = SyncResult(
+          status: SyncStatus.synced,
+          pendingCount: 0,
+          authenticatedOwnerId: authenticatedUser.id,
+          message: 'All records are up to date.',
+        );
+        _lastSyncResult = res;
+        return res;
+      }
+
+      int syncedSuccess = 0;
+
+      // Strict Ordering (Requirement 6):
+      // Synchronize student_profiles BEFORE uploading student_attempts
+      final profileItems = queueItems.where((r) => r['entity_type'] == 'student_profile').toList();
+      final attemptItems = queueItems.where((r) => r['entity_type'] == 'attempt').toList();
+      final otherItems = queueItems.where((r) => r['entity_type'] != 'student_profile' && r['entity_type'] != 'attempt').toList();
+
+      // 1. Sync Student Profiles first
+      for (var row in profileItems) {
+        final itemId = row['id'] as String;
+        final payloadJson = row['payload_json'] as String;
+        final Map<String, dynamic> payload = json.decode(payloadJson);
+
+        try {
+          await _supabaseClient!.from('student_profiles').upsert({
+            'id': payload['id'],
+            'owner_id': authenticatedUser.id, // Strictly uses authenticated user's UUID
+            'name': payload['name'],
+            'class_id': payload['class_id'],
+            'preferred_language': payload['preferred_language'],
+            'avatar_id': payload['avatar_id'],
+            'classroom_code': payload['classroom_code'],
+            'created_at': payload['created_at'],
+            'last_active_at': payload['last_active_at'],
+          });
+
+          await db.update(
+            'sync_queue',
+            {
+              'status': 'synced',
+              'last_attempt_at': DateTime.now().toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [itemId],
+          );
+          syncedSuccess++;
+        } catch (e) {
+          final retries = (row['retry_count'] as int) + 1;
+          await db.update(
+            'sync_queue',
+            {
+              'status': 'failed',
+              'retry_count': retries,
+              'last_attempt_at': DateTime.now().toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [itemId],
+          );
+        }
+      }
+
+      // 2. Sync Student Attempts second (Strict requirement: ignoreDuplicates: true)
+      for (var row in attemptItems) {
+        final itemId = row['id'] as String;
+        final payloadJson = row['payload_json'] as String;
+        final Map<String, dynamic> payload = json.decode(payloadJson);
+
+        try {
+          await _supabaseClient!.from('student_attempts').upsert(
+            {
+              'id': payload['attempt_id'],
+              'student_id': payload['student_id'],
+              'question_id': payload['question_id'],
+              'topic_id': payload['topic_id'],
+              'skill_id': payload['skill_id'],
+              'selected_option_id': payload['selected_option_id'],
+              'is_correct': payload['is_correct'],
+              'difficulty': payload['difficulty'],
+              'mastery_before': payload['mastery_before'],
+              'mastery_after': payload['mastery_after'],
+              'answered_at': payload['answered_at'],
+              'created_at': payload['created_at'],
+            },
+            ignoreDuplicates: true,
+          );
+
+          await db.update(
+            'sync_queue',
+            {
+              'status': 'synced',
+              'last_attempt_at': DateTime.now().toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [itemId],
+          );
+          syncedSuccess++;
+        } catch (e) {
+          final retries = (row['retry_count'] as int) + 1;
+          await db.update(
+            'sync_queue',
+            {
+              'status': 'failed',
+              'retry_count': retries,
+              'last_attempt_at': DateTime.now().toIso8601String(),
+            },
+            where: 'id = ?',
+            whereArgs: [itemId],
+          );
+        }
+      }
+
+      // 3. Sync any other remaining items
+      for (var row in otherItems) {
+        final itemId = row['id'] as String;
+        // Mark as synced locally
+        await db.update(
+          'sync_queue',
+          {
+            'status': 'synced',
+            'last_attempt_at': DateTime.now().toIso8601String(),
+          },
+          where: 'id = ?',
+          whereArgs: [itemId],
+        );
+        syncedSuccess++;
+      }
+
+      final remaining = await getPendingSyncCount();
+      if (remaining == 0) {
+        final res = SyncResult(
+          status: SyncStatus.synced,
+          pendingCount: 0,
+          syncedCount: syncedSuccess,
+          authenticatedOwnerId: authenticatedUser.id,
+          message: syncedSuccess > 0 
+              ? 'Successfully synchronized $syncedSuccess records.'
+              : 'All records are up to date.',
+        );
+        _lastSyncResult = res;
+        return res;
+      } else {
+        final res = SyncResult(
+          status: SyncStatus.failed,
+          pendingCount: remaining,
+          syncedCount: syncedSuccess,
+          authenticatedOwnerId: authenticatedUser.id,
+          message: 'Synced $syncedSuccess records, $remaining remaining. Will retry when connected.',
+        );
+        _lastSyncResult = res;
+        return res;
+      }
+    } catch (unexpectedError) {
+      final res = SyncResult(
         status: SyncStatus.failed,
-        pendingCount: remaining,
-        syncedCount: syncedSuccess,
-        authenticatedOwnerId: authenticatedUser.id,
-        message: 'Synced $syncedSuccess records, $remaining remaining.',
+        pendingCount: await getPendingSyncCount(),
+        message: _toUserFriendlyError(unexpectedError),
       );
+      _lastSyncResult = res;
+      return res;
+    } finally {
+      _isSynchronizing = false;
     }
-  } finally {
-    _isSynchronizing = false;
   }
-}
 }

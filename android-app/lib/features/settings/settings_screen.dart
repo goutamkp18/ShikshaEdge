@@ -235,7 +235,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
             // Backend Synchronization Section
             const Text(
-              'Cloud Synchronization (Teammate Integration)',
+              'Cloud Synchronization',
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 12),
