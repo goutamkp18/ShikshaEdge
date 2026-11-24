@@ -1,0 +1,35 @@
+# Build and cache directories
+build/
+**/build/
+.dart_tool/
+**/.dart_tool/
+.gradle/
+**/.gradle/
+.pub/
+.pub-cache/
+/coverage/
+
+# Android local configs and intermediate artifacts
+**/android/local.properties
+**/android/captures/
+**/android/**/GeneratedPluginRegistrant.java
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+
+# Binaries and large bundles
+*.apk
+*.aab
+*.symbols
+*.map.json
+
+# IDE and Editor files
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.DS_Store
+*.log
+*.pyc
+__pycache__/

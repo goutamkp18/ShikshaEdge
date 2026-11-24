@@ -1,0 +1,56 @@
+name: shikshaedge
+description: "ShikshaEdge - Low-Bandwidth Adaptive Learning for Rural Schools"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: any
+
+  # State Management & Navigation
+  flutter_riverpod: ^2.6.1
+  go_router: ^14.8.1
+
+  # Offline Database & Storage
+  sqflite: ^2.4.1
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  shared_preferences: ^2.5.2
+
+  # Adaptive Learning & Utilities
+  uuid: ^4.5.1
+  fl_chart: ^0.70.2
+  flutter_svg: ^2.0.17
+
+  # Audio & Connectivity
+  just_audio: ^0.9.46
+  connectivity_plus: ^6.1.4
+
+  # Backend Integration (Optional/Provisional)
+  supabase_flutter: ^2.8.4
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  sqflite_common_ffi: ^2.3.4+4
+
+flutter:
+  uses-material-design: true
+  generate: true
+  assets:
+    - assets/content/
+    - assets/audio/en/mathematics/
+    - assets/audio/kn/mathematics/
+    - assets/audio/en/science/
+    - assets/audio/kn/science/
+    - assets/audio/en/english/
+    - assets/audio/kn/english/
