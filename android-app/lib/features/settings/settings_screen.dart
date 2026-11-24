@@ -29,6 +29,85 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       SnackBar(
         content: Text(result.message),
         backgroundColor: result.status == SyncStatus.synced ? AppColors.successGreen : AppColors.errorRed,
+        action: result.status == SyncStatus.failed
+            ? SnackBarAction(
+                label: 'View Logs',
+                textColor: Colors.white,
+                onPressed: _showDiagnosticsBottomSheet,
+              )
+            : null,
+      ),
+    );
+  }
+
+  void _showDiagnosticsBottomSheet() {
+    final syncService = ref.read(syncServiceProvider);
+    final logs = syncService.diagnosticLogs;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        maxChildSize: 0.9,
+        minChildSize: 0.4,
+        expand: false,
+        builder: (_, scrollController) => Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.receipt_long_rounded, color: AppColors.primaryIndigo),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Sync Diagnostics Log',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded),
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+              const Divider(),
+              Expanded(
+                child: logs.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'No synchronization attempts logged yet.\nTap "Sync Progress Now" to initiate.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: AppColors.secondaryText),
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: scrollController,
+                        itemCount: logs.length,
+                        itemBuilder: (context, idx) {
+                          final line = logs[idx];
+                          final isError = line.contains('Error') || line.contains('failed');
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Text(
+                              line,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11,
+                                color: isError ? AppColors.errorRed : const Color(0xFF334155),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -298,6 +377,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                           label: Text(
                             _isSyncing ? 'Syncing...' : 'Sync Progress Now',
                             style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Center(
+                        child: TextButton.icon(
+                          onPressed: _showDiagnosticsBottomSheet,
+                          icon: const Icon(Icons.receipt_long_rounded, size: 16),
+                          label: const Text(
+                            'View Sync Diagnostics',
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                           ),
                         ),
                       ),

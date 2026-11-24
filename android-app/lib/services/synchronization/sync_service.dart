@@ -39,8 +39,21 @@ class SyncService {
   StreamSubscription<bool>? _connectivitySubscription;
   bool _isSynchronizing = false;
   SyncResult? _lastSyncResult;
+  final List<String> _diagnosticLogs = [];
 
   SyncResult? get lastSyncResult => _lastSyncResult;
+  List<String> get diagnosticLogs => List.unmodifiable(_diagnosticLogs);
+
+  void _log(String message) {
+    final now = DateTime.now();
+    final timeStr = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+    final entry = '[$timeStr] $message';
+    _diagnosticLogs.add(entry);
+    if (_diagnosticLogs.length > 50) {
+      _diagnosticLogs.removeAt(0);
+    }
+    debugPrint('[SyncService] $message');
+  }
 
   SyncService({
     DatabaseHelper? dbHelper,
@@ -70,12 +83,14 @@ class SyncService {
   /// Logs errors with full PostgREST diagnostics without exposing secret keys/tokens
   void _logError(String operation, dynamic error) {
     if (error is PostgrestException) {
+      _log('PostgREST Error in $operation: Code ${error.code}: ${error.message} (Hint: ${error.hint ?? "none"})');
       debugPrint('[SyncService][$operation] PostgREST Error:');
       debugPrint('  Status/Code: ${error.code}');
       debugPrint('  Message: ${error.message}');
       debugPrint('  Details: ${error.details}');
       debugPrint('  Hint: ${error.hint}');
     } else {
+      _log('Error in $operation: $error');
       debugPrint('[SyncService][$operation] Error: $error');
     }
   }
@@ -291,10 +306,11 @@ class SyncService {
 
     try {
       final pendingCount = await getPendingSyncCount();
+      _log('Starting synchronization. Pending items: $pendingCount');
       final isOnline = await _connectivity.checkIsOnline();
 
       if (!isOnline) {
-        debugPrint('[SyncService] Device is offline. Aborting sync.');
+        _log('Device is offline. Aborting sync.');
         final res = SyncResult(
           status: SyncStatus.offline,
           pendingCount: pendingCount,
@@ -355,14 +371,14 @@ class SyncService {
       // versions are uploaded to Supabase before their quiz attempts are sent.
       // =========================================================================
       final localStudents = await db.query('students');
-      debugPrint('[SyncService] Found ${localStudents.length} local student profile(s) in SQLite.');
+      _log('Found ${localStudents.length} local student profile(s) in SQLite.');
 
       final Set<String> verifiedCloudStudentIds = {};
 
       for (var s in localStudents) {
         final studentId = s['id'] as String;
         try {
-          debugPrint('[SyncService] Ensuring student profile $studentId (${s['name']}) is synced to Supabase under owner ${authenticatedUser.id}');
+          _log('Ensuring profile for student $studentId (${s['name']}) is synced in Supabase...');
           await _supabaseClient!.from('student_profiles').upsert({
             'id': studentId,
             'owner_id': authenticatedUser.id,
@@ -375,7 +391,7 @@ class SyncService {
             'last_active_at': s['last_active_at'] ?? DateTime.now().toIso8601String(),
           });
           verifiedCloudStudentIds.add(studentId);
-          debugPrint('[SyncService] Student profile $studentId successfully confirmed in cloud.');
+          _log('Student profile $studentId successfully confirmed in cloud.');
 
           // Mark any corresponding student_profile items in sync_queue as synced
           await db.update(
@@ -517,7 +533,7 @@ class SyncService {
 
         try {
           final normalizedDiff = _normalizeDifficulty(payload['difficulty']);
-          debugPrint('[SyncService] Upserting attempt ${payload['attempt_id']} for student $studentId (diff: $normalizedDiff)');
+          _log('Upserting attempt ${payload['attempt_id']} for student $studentId (diff: $normalizedDiff)');
 
           await _supabaseClient!.from('student_attempts').upsert(
             {
@@ -547,7 +563,7 @@ class SyncService {
             whereArgs: [itemId],
           );
           syncedSuccess++;
-          debugPrint('[SyncService] Attempt ${payload['attempt_id']} successfully synced.');
+          _log('Attempt ${payload['attempt_id']} successfully synced.');
         } catch (e) {
           _logError('student_attempts.upsert ($itemId)', e);
           lastServerErrorMessage = _extractPostgrestErrorMessage(e);
