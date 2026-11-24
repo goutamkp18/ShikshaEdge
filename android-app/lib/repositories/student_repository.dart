@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../core/config/app_config.dart';
@@ -82,6 +83,17 @@ class StudentRepository {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(AppConfig.keyLanguage, preferredLanguage);
 
+    // Enqueue student profile for cloud synchronization
+    await db.insert('sync_queue', {
+      'id': _uuid.v4(),
+      'entity_type': 'student_profile',
+      'entity_id': student.id,
+      'payload_json': json.encode(student.toMap()),
+      'created_at': now.toIso8601String(),
+      'retry_count': 0,
+      'status': 'pending',
+    });
+
     return student;
   }
 
@@ -93,5 +105,16 @@ class StudentRepository {
       where: 'id = ?',
       whereArgs: [student.id],
     );
+
+    // Enqueue profile update for cloud synchronization
+    await db.insert('sync_queue', {
+      'id': _uuid.v4(),
+      'entity_type': 'student_profile',
+      'entity_id': student.id,
+      'payload_json': json.encode(student.toMap()),
+      'created_at': DateTime.now().toIso8601String(),
+      'retry_count': 0,
+      'status': 'pending',
+    });
   }
 }

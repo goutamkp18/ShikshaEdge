@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/config/app_config.dart';
@@ -64,6 +65,49 @@ class SyncService {
 
   void dispose() {
     _connectivitySubscription?.cancel();
+  }
+
+  /// Logs errors with full PostgREST diagnostics without exposing secret keys/tokens
+  void _logError(String operation, dynamic error) {
+    if (error is PostgrestException) {
+      debugPrint('[SyncService][$operation] PostgREST Error:');
+      debugPrint('  Status/Code: ${error.code}');
+      debugPrint('  Message: ${error.message}');
+      debugPrint('  Details: ${error.details}');
+      debugPrint('  Hint: ${error.hint}');
+    } else {
+      debugPrint('[SyncService][$operation] Error: $error');
+    }
+  }
+
+  /// Extracts clean, informative message for PostgREST errors
+  String _extractPostgrestErrorMessage(dynamic error) {
+    if (error is PostgrestException) {
+      final code = error.code ?? '';
+      if (code == '42501') {
+        return 'Permission check failed (RLS 42501). Profile must be synced first.';
+      }
+      if (code == '23503') {
+        return 'Referenced student ID does not exist in cloud database (FK 23503).';
+      }
+      if (code == '23514') {
+        return 'Check constraint failed (${error.message}).';
+      }
+      if (code == '23505') {
+        return 'Duplicate record detected on server.';
+      }
+      return 'Server error ($code: ${error.message})';
+    }
+    return _toUserFriendlyError(error);
+  }
+
+  /// Strictly normalizes question difficulty to Postgres check constraint requirements
+  String _normalizeDifficulty(dynamic raw) {
+    if (raw == null) return 'easy';
+    final s = raw.toString().toLowerCase().trim();
+    if (s == 'medium' || s == 'intermediate' || s == '2') return 'medium';
+    if (s == 'hard' || s == 'advanced' || s == '3') return 'hard';
+    return 'easy';
   }
 
   String _toUserFriendlyError(dynamic error) {
@@ -170,6 +214,7 @@ class SyncService {
     final inMemoryUser = client.auth.currentUser;
     final inMemorySession = client.auth.currentSession;
     if (inMemoryUser != null && inMemorySession != null) {
+      debugPrint('[SyncService] Using active in-memory session for UID: ${inMemoryUser.id}');
       await AppConfig.saveCloudOwnerId(inMemoryUser.id);
       await AppConfig.savePersistedSession(json.encode(inMemorySession.toJson()));
       return inMemoryUser;
@@ -181,6 +226,7 @@ class SyncService {
     // 2. If a session was previously saved, attempt to recover it
     if (savedSessionJson != null && savedSessionJson.isNotEmpty) {
       try {
+        debugPrint('[SyncService] Recovering saved session for expected owner: $savedOwnerId');
         final res = await client.auth.recoverSession(savedSessionJson);
         final restoredUser = res.user ?? client.auth.currentUser;
         final restoredSession = res.session ?? client.auth.currentSession;
@@ -193,10 +239,11 @@ class SyncService {
           if (restoredSession != null) {
             await AppConfig.savePersistedSession(json.encode(restoredSession.toJson()));
           }
+          debugPrint('[SyncService] Successfully restored session for UID: ${restoredUser.id}');
           return restoredUser;
         }
       } catch (e) {
-        // Session restoration failed
+        _logError('auth.recoverSession', e);
         if (savedOwnerId != null) {
           throw Exception('Existing cloud identity ($savedOwnerId) restoration failed: ${e.toString()}. Cannot silently replace identity.');
         }
@@ -209,6 +256,7 @@ class SyncService {
     }
 
     // 4. First cloud connection for this device: authenticate anonymously
+    debugPrint('[SyncService] Creating new anonymous authentication session...');
     final authResponse = await client.auth.signInAnonymously();
     final newUser = authResponse.user;
     final newSession = authResponse.session;
@@ -216,6 +264,8 @@ class SyncService {
     if (newUser == null) {
       throw Exception('Supabase anonymous sign-in failed: no user returned.');
     }
+
+    debugPrint('[SyncService] Successfully signed in anonymously as UID: ${newUser.id}');
 
     // Securely persist new identity and session across restarts
     await AppConfig.saveCloudOwnerId(newUser.id);
@@ -237,12 +287,14 @@ class SyncService {
       );
     }
     _isSynchronizing = true;
+    String? lastServerErrorMessage;
 
     try {
       final pendingCount = await getPendingSyncCount();
       final isOnline = await _connectivity.checkIsOnline();
 
       if (!isOnline) {
+        debugPrint('[SyncService] Device is offline. Aborting sync.');
         final res = SyncResult(
           status: SyncStatus.offline,
           pendingCount: pendingCount,
@@ -269,6 +321,7 @@ class SyncService {
       try {
         _supabaseClient ??= SupabaseClient(url, anonKey);
       } catch (e) {
+        _logError('client.init', e);
         final res = SyncResult(
           status: SyncStatus.failed,
           pendingCount: pendingCount,
@@ -283,6 +336,7 @@ class SyncService {
       try {
         authenticatedUser = await getOrCreateAuthenticatedUser(_supabaseClient!);
       } catch (authError) {
+        _logError('auth.signInAnonymously', authError);
         final res = SyncResult(
           status: SyncStatus.failed,
           pendingCount: pendingCount,
@@ -293,12 +347,63 @@ class SyncService {
       }
 
       final db = await _dbHelper.database;
+      int syncedSuccess = 0;
+
+      // =========================================================================
+      // STEP 1: Pre-synchronize ALL local student profiles
+      // Requirement 6 & 7: Guarantees offline profiles created in earlier APK
+      // versions are uploaded to Supabase before their quiz attempts are sent.
+      // =========================================================================
+      final localStudents = await db.query('students');
+      debugPrint('[SyncService] Found ${localStudents.length} local student profile(s) in SQLite.');
+
+      final Set<String> verifiedCloudStudentIds = {};
+
+      for (var s in localStudents) {
+        final studentId = s['id'] as String;
+        try {
+          debugPrint('[SyncService] Ensuring student profile $studentId (${s['name']}) is synced to Supabase under owner ${authenticatedUser.id}');
+          await _supabaseClient!.from('student_profiles').upsert({
+            'id': studentId,
+            'owner_id': authenticatedUser.id,
+            'name': s['name'],
+            'class_id': s['class_id'],
+            'preferred_language': s['preferred_language'] ?? 'en',
+            'avatar_id': s['avatar_id'] ?? 'avatar_owl',
+            'classroom_code': s['classroom_code'],
+            'created_at': s['created_at'],
+            'last_active_at': s['last_active_at'] ?? DateTime.now().toIso8601String(),
+          });
+          verifiedCloudStudentIds.add(studentId);
+          debugPrint('[SyncService] Student profile $studentId successfully confirmed in cloud.');
+
+          // Mark any corresponding student_profile items in sync_queue as synced
+          await db.update(
+            'sync_queue',
+            {
+              'status': 'synced',
+              'last_attempt_at': DateTime.now().toIso8601String(),
+            },
+            where: "entity_type = 'student_profile' AND (entity_id = ? OR payload_json LIKE ?)",
+            whereArgs: [studentId, '%$studentId%'],
+          );
+        } catch (profileError) {
+          _logError('student_profiles.upsert ($studentId)', profileError);
+          lastServerErrorMessage = _extractPostgrestErrorMessage(profileError);
+        }
+      }
+
+      // =========================================================================
+      // STEP 2: Query queue items (pending or failed)
+      // =========================================================================
       final queueItems = await db.query(
         'sync_queue',
         where: "status = 'pending' OR status = 'failed'",
         orderBy: 'created_at ASC',
         limit: 100,
       );
+
+      debugPrint('[SyncService] Queue contains ${queueItems.length} items to process.');
 
       if (queueItems.isEmpty) {
         final res = SyncResult(
@@ -311,28 +416,27 @@ class SyncService {
         return res;
       }
 
-      int syncedSuccess = 0;
-
       // Strict Ordering (Requirement 6):
-      // Synchronize student_profiles BEFORE uploading student_attempts
+      // Profiles are processed first, then attempts
       final profileItems = queueItems.where((r) => r['entity_type'] == 'student_profile').toList();
       final attemptItems = queueItems.where((r) => r['entity_type'] == 'attempt').toList();
       final otherItems = queueItems.where((r) => r['entity_type'] != 'student_profile' && r['entity_type'] != 'attempt').toList();
 
-      // 1. Sync Student Profiles first
+      // 1. Process profile items from queue
       for (var row in profileItems) {
         final itemId = row['id'] as String;
         final payloadJson = row['payload_json'] as String;
         final Map<String, dynamic> payload = json.decode(payloadJson);
+        final studentId = payload['id'] as String;
 
         try {
           await _supabaseClient!.from('student_profiles').upsert({
-            'id': payload['id'],
-            'owner_id': authenticatedUser.id, // Strictly uses authenticated user's UUID
+            'id': studentId,
+            'owner_id': authenticatedUser.id,
             'name': payload['name'],
             'class_id': payload['class_id'],
-            'preferred_language': payload['preferred_language'],
-            'avatar_id': payload['avatar_id'],
+            'preferred_language': payload['preferred_language'] ?? 'en',
+            'avatar_id': payload['avatar_id'] ?? 'avatar_owl',
             'classroom_code': payload['classroom_code'],
             'created_at': payload['created_at'],
             'last_active_at': payload['last_active_at'],
@@ -347,8 +451,12 @@ class SyncService {
             where: 'id = ?',
             whereArgs: [itemId],
           );
+          verifiedCloudStudentIds.add(studentId);
           syncedSuccess++;
+          debugPrint('[SyncService] Synced profile queue item: $itemId (Student: $studentId)');
         } catch (e) {
+          _logError('student_profiles.queue_upsert ($itemId)', e);
+          lastServerErrorMessage = _extractPostgrestErrorMessage(e);
           final retries = (row['retry_count'] as int) + 1;
           await db.update(
             'sync_queue',
@@ -363,13 +471,54 @@ class SyncService {
         }
       }
 
-      // 2. Sync Student Attempts second (Strict requirement: ignoreDuplicates: true)
+      // 2. Process attempt items with student verification & ignoreDuplicates: true
       for (var row in attemptItems) {
         final itemId = row['id'] as String;
         final payloadJson = row['payload_json'] as String;
         final Map<String, dynamic> payload = json.decode(payloadJson);
+        final studentId = payload['student_id'] as String?;
+
+        // Requirement 8: Verify referenced student_id exists in Supabase before inserting
+        if (studentId == null || !verifiedCloudStudentIds.contains(studentId)) {
+          bool studentExistsInCloud = false;
+          if (studentId != null) {
+            try {
+              final check = await _supabaseClient!
+                  .from('student_profiles')
+                  .select('id')
+                  .eq('id', studentId)
+                  .maybeSingle();
+              if (check != null) {
+                studentExistsInCloud = true;
+                verifiedCloudStudentIds.add(studentId);
+              }
+            } catch (e) {
+              _logError('student_profiles.check ($studentId)', e);
+            }
+          }
+
+          if (!studentExistsInCloud) {
+            debugPrint('[SyncService] Cannot sync attempt $itemId: student_id $studentId is not in Supabase.');
+            lastServerErrorMessage = 'Student profile must exist in cloud before uploading quiz attempts.';
+            final retries = (row['retry_count'] as int) + 1;
+            await db.update(
+              'sync_queue',
+              {
+                'status': 'failed',
+                'retry_count': retries,
+                'last_attempt_at': DateTime.now().toIso8601String(),
+              },
+              where: 'id = ?',
+              whereArgs: [itemId],
+            );
+            continue;
+          }
+        }
 
         try {
+          final normalizedDiff = _normalizeDifficulty(payload['difficulty']);
+          debugPrint('[SyncService] Upserting attempt ${payload['attempt_id']} for student $studentId (diff: $normalizedDiff)');
+
           await _supabaseClient!.from('student_attempts').upsert(
             {
               'id': payload['attempt_id'],
@@ -379,7 +528,7 @@ class SyncService {
               'skill_id': payload['skill_id'],
               'selected_option_id': payload['selected_option_id'],
               'is_correct': payload['is_correct'],
-              'difficulty': payload['difficulty'],
+              'difficulty': normalizedDiff,
               'mastery_before': payload['mastery_before'],
               'mastery_after': payload['mastery_after'],
               'answered_at': payload['answered_at'],
@@ -398,7 +547,10 @@ class SyncService {
             whereArgs: [itemId],
           );
           syncedSuccess++;
+          debugPrint('[SyncService] Attempt ${payload['attempt_id']} successfully synced.');
         } catch (e) {
+          _logError('student_attempts.upsert ($itemId)', e);
+          lastServerErrorMessage = _extractPostgrestErrorMessage(e);
           final retries = (row['retry_count'] as int) + 1;
           await db.update(
             'sync_queue',
@@ -416,7 +568,6 @@ class SyncService {
       // 3. Sync any other remaining items
       for (var row in otherItems) {
         final itemId = row['id'] as String;
-        // Mark as synced locally
         await db.update(
           'sync_queue',
           {
@@ -443,17 +594,28 @@ class SyncService {
         _lastSyncResult = res;
         return res;
       } else {
+        // Requirement 18: Distinguish server rejection from connectivity failure
+        final String failMessage;
+        if (syncedSuccess > 0) {
+          failMessage = 'Synced $syncedSuccess records, $remaining remaining. (Server: ${lastServerErrorMessage ?? "in progress"})';
+        } else if (lastServerErrorMessage != null) {
+          failMessage = 'Cloud rejected sync: $lastServerErrorMessage. Local data safe.';
+        } else {
+          failMessage = 'Could not sync $remaining records. Progress is safely saved locally.';
+        }
+
         final res = SyncResult(
           status: SyncStatus.failed,
           pendingCount: remaining,
           syncedCount: syncedSuccess,
           authenticatedOwnerId: authenticatedUser.id,
-          message: 'Synced $syncedSuccess records, $remaining remaining. Will retry when connected.',
+          message: failMessage,
         );
         _lastSyncResult = res;
         return res;
       }
     } catch (unexpectedError) {
+      _logError('sync.unexpected', unexpectedError);
       final res = SyncResult(
         status: SyncStatus.failed,
         pendingCount: await getPendingSyncCount(),

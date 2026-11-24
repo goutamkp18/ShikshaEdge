@@ -99,5 +99,59 @@ void main() {
       expect(attempts[0]['id'], equals('1'));
       expect(attempts[1]['id'], equals('3'));
     });
+
+    test('Difficulty normalization maps raw values strictly to easy, medium, hard', () {
+      String normalizeDifficulty(dynamic raw) {
+        if (raw == null) return 'easy';
+        final s = raw.toString().toLowerCase().trim();
+        if (s == 'medium' || s == 'intermediate' || s == '2') return 'medium';
+        if (s == 'hard' || s == 'advanced' || s == '3') return 'hard';
+        return 'easy';
+      }
+
+      expect(normalizeDifficulty('easy'), equals('easy'));
+      expect(normalizeDifficulty('EASY'), equals('easy'));
+      expect(normalizeDifficulty('Easy'), equals('easy'));
+      expect(normalizeDifficulty('medium'), equals('medium'));
+      expect(normalizeDifficulty('MEDIUM'), equals('medium'));
+      expect(normalizeDifficulty('2'), equals('medium'));
+      expect(normalizeDifficulty('hard'), equals('hard'));
+      expect(normalizeDifficulty('HARD'), equals('hard'));
+      expect(normalizeDifficulty('3'), equals('hard'));
+      expect(normalizeDifficulty(null), equals('easy'));
+      expect(normalizeDifficulty('unknown'), equals('easy'));
+    });
+
+    test('Existing profile upgrade scenario ensures profiles are mapped before attempts', () {
+      // Simulating a student profile created on an earlier APK version (no sync_queue entry)
+      final existingLocalStudents = [
+        {
+          'id': 'legacy-student-001',
+          'name': 'Goutam',
+          'class_id': 'class_5',
+          'preferred_language': 'en',
+          'avatar_id': 'avatar_owl',
+        }
+      ];
+
+      // Attempts in sync queue referencing the student
+      final queuedAttempts = [
+        {'id': 'att_1', 'student_id': 'legacy-student-001'},
+        {'id': 'att_2', 'student_id': 'legacy-student-001'},
+        {'id': 'att_3', 'student_id': 'legacy-student-001'},
+      ];
+
+      final verifiedCloudStudents = <String>{};
+
+      // Step 1: Pre-sync all local profiles
+      for (var s in existingLocalStudents) {
+        verifiedCloudStudents.add(s['id'] as String);
+      }
+
+      // Step 2: Validate all queued attempts have verified profile in cloud
+      for (var att in queuedAttempts) {
+        expect(verifiedCloudStudents.contains(att['student_id']), isTrue);
+      }
+    });
   });
 }

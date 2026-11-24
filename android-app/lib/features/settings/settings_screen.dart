@@ -224,7 +224,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   ListTile(
                     leading: const Icon(Icons.storage_rounded, color: AppColors.primaryIndigo),
                     title: const Text('Local SQLite Database'),
-                    subtitle: const Text('shikshaedge.db • Healthy & Encrypted'),
+                    subtitle: const Text('shikshaedge.db • Healthy & Sandboxed'),
                     trailing: const Icon(Icons.check_circle_rounded, color: AppColors.successGreen, size: 20),
                   ),
                 ],
